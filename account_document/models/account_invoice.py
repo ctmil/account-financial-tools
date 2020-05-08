@@ -4,9 +4,10 @@
 ##############################################################################
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+from functools import partial
 # import odoo.addons.decimal_precision as dp
 # import re
-# from odoo.tools.misc import formatLang
+from odoo.tools.misc import formatLang
 import logging
 _logger = logging.getLogger(__name__)
 
@@ -28,27 +29,20 @@ class AccountInvoice(models.Model):
     _order = "date_invoice desc, document_number desc, number desc, id desc"
     # _order = "document_number desc, number desc, id desc"
 
-    report_amount_tax = fields.Monetary(
-        string='Tax',
-        compute='_compute_report_amount_and_taxes'
-    )
     report_amount_untaxed = fields.Monetary(
-        string='Untaxed Amount',
         compute='_compute_report_amount_and_taxes'
     )
     report_tax_line_ids = fields.One2many(
         compute="_compute_report_amount_and_taxes",
         comodel_name='account.invoice.tax',
-        string='Taxes'
     )
     available_journal_document_type_ids = fields.Many2many(
         'account.journal.document.type',
         compute='_compute_available_journal_document_types',
-        string='Available Journal Document Types',
     )
     journal_document_type_id = fields.Many2one(
         'account.journal.document.type',
-        'Document Type',
+        'Journal Document Type',
         readonly=True,
         ondelete='restrict',
         copy=False,
@@ -58,15 +52,14 @@ class AccountInvoice(models.Model):
     # we add this fields so we can search, group and analyze by this one
     document_type_id = fields.Many2one(
         related='journal_document_type_id.document_type_id',
+        string='Document Type',
         copy=False,
-        readonly=True,
         store=True,
         auto_join=True,
         index=True,
     )
     document_sequence_id = fields.Many2one(
         related='journal_document_type_id.sequence_id',
-        readonly=True,
     )
     document_number = fields.Char(
         string='Document Number',
@@ -82,37 +75,39 @@ class AccountInvoice(models.Model):
     )
     next_number = fields.Integer(
         compute='_compute_next_number',
-        string='Next Number',
+        string='Next Number (Computed)',
     )
     use_documents = fields.Boolean(
         related='journal_id.use_documents',
         string='Use Documents?',
-        readonly=True,
     )
     localization = fields.Selection(
         related='company_id.localization',
-        readonly=True,
     )
     document_type_internal_type = fields.Selection(
         related='document_type_id.internal_type',
-        readonly=True,
     )
 
-# @api.multi
-# def _get_tax_amount_by_group(self):
-#     """ Method used by qweb invoice report. We are not using this report
-#     for now.
-#     """
-#     self.ensure_one()
-#     res = {}
-#     currency = self.currency_id or self.company_id.currency_id
-#     for line in self.report_tax_line_ids:
-#         res.setdefault(line.tax_id.tax_group_id, 0.0)
-#         res[line.tax_id.tax_group_id] += line.amount
-#     res = sorted(res.items(), key=lambda l: l[0].sequence)
-#     res = map(lambda l: (
-#         l[0].name, formatLang(self.env, l[1], currency_obj=currency)), res)
-#     return res
+    def _amount_by_group(self):
+        invoice_with_doc_type = self.filtered('document_type_id')
+        for invoice in invoice_with_doc_type:
+            currency = invoice.currency_id or invoice.company_id.currency_id
+            fmt = partial(formatLang, invoice.with_context(
+                lang=invoice.partner_id.lang).env, currency_obj=currency)
+            res = {}
+            for line in invoice.report_tax_line_ids:
+                tax = line.tax_id
+                group_key = (tax.tax_group_id, tax.amount_type, tax.amount)
+                res.setdefault(group_key, {'base': 0.0, 'amount': 0.0})
+                res[group_key]['amount'] += line.amount_total
+                res[group_key]['base'] += line.base
+            res = sorted(res.items(), key=lambda l: l[0][0].sequence)
+            invoice.amount_by_group = [(
+                r[0][0].name, r[1]['amount'], r[1]['base'],
+                fmt(r[1]['amount']), fmt(r[1]['base']),
+                len(res),
+            ) for r in res]
+        super(AccountInvoice, self - invoice_with_doc_type)._amount_by_group()
 
     @api.depends(
         'amount_untaxed', 'amount_tax', 'tax_line_ids', 'document_type_id')
@@ -122,7 +117,6 @@ class AccountInvoice(models.Model):
                 invoice.document_type_id and
                 invoice.document_type_id.get_taxes_included() or False)
             if not taxes_included:
-                report_amount_tax = invoice.amount_tax
                 report_amount_untaxed = invoice.amount_untaxed
                 not_included_taxes = invoice.tax_line_ids
             else:
@@ -130,10 +124,8 @@ class AccountInvoice(models.Model):
                     lambda x: x.tax_id in taxes_included)
                 not_included_taxes = (
                     invoice.tax_line_ids - included_taxes)
-                report_amount_tax = sum(not_included_taxes.mapped('amount'))
                 report_amount_untaxed = invoice.amount_untaxed + sum(
                     included_taxes.mapped('amount'))
-            invoice.report_amount_tax = report_amount_tax
             invoice.report_amount_untaxed = report_amount_untaxed
             invoice.report_tax_line_ids = not_included_taxes
 
@@ -174,19 +166,12 @@ class AccountInvoice(models.Model):
 
     @api.multi
     def name_get(self):
-        TYPES = {
-            'out_invoice': _('Invoice'),
-            'in_invoice': _('Vendor Bill'),
-            'out_refund': _('Refund'),
-            'in_refund': _('Vendor Refund'),
-        }
         result = []
         for inv in self:
             result.append((
                 inv.id,
                 "%s %s" % (
-                    inv.display_name or TYPES[inv.type],
-                    inv.name or '')))
+                    inv.display_name, inv.name or '')))
         return result
 
     @api.model
@@ -237,13 +222,19 @@ class AccountInvoice(models.Model):
         # mostrar igual si existe el numero, por ejemplo si es factura de
         # proveedor
         # if self.document_number and self.document_type_id and self.move_name:
+        TYPES = {
+            'out_invoice': _('Invoice'),
+            'in_invoice': _('Vendor Bill'),
+            'out_refund': _('Credit Note'),
+            'in_refund': _('Vendor Credit note'),
+        }
         for rec in self:
             if rec.document_number and rec.document_type_id:
                 display_name = ("%s%s" % (
                     rec.document_type_id.doc_code_prefix or '',
                     rec.document_number))
             else:
-                display_name = rec.move_name
+                display_name = rec.move_name or TYPES[rec.type]
             rec.display_name = display_name
 
     @api.multi
@@ -368,16 +359,19 @@ class AccountInvoice(models.Model):
     @api.multi
     def write(self, vals):
         """
-        If someone change the type (for eg from sale order), we update
-        de document type
+        If someone change the type or the journal (for eg from sale order),
+        we update the document type
         """
         inv_type = vals.get('type')
+        journal_id = vals.get('journal_id')
         # if len(vals) == 1 and vals.get('type'):
         # podrian pasarse otras cosas ademas del type
-        if inv_type:
+        if inv_type or journal_id:
             for rec in self:
+                journal = journal_id and self.env['account.journal'].browse(
+                    journal_id) or rec.journal_id
                 res = rec._get_available_journal_document_types(
-                    rec.journal_id, inv_type, rec.partner_id)
+                    journal, inv_type or rec.type, rec.partner_id)
                 vals['journal_document_type_id'] = res[
                     'journal_document_type'].id
                 # call write for each inoice

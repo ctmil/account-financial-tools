@@ -4,6 +4,7 @@
 ##############################################################################
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+from odoo.tools.safe_eval import safe_eval
 from dateutil.relativedelta import relativedelta
 import logging
 _logger = logging.getLogger(__name__)
@@ -12,6 +13,7 @@ _logger = logging.getLogger(__name__)
 class ResCompanyInterest(models.Model):
 
     _name = 'res.company.interest'
+    _description = 'Account Interest'
 
     company_id = fields.Many2one(
         'res.company',
@@ -78,50 +80,57 @@ class ResCompanyInterest(models.Model):
         'Date of Next Invoice',
         default=fields.Date.today,
     )
+    domain = fields.Char(
+        'Additional Filters',
+        default="[]",
+        help="Extra filters that will be added to the standard search"
+    )
+    has_domain = fields.Boolean(compute="_compute_has_domain")
 
     @api.model
     def _cron_recurring_interests_invoices(self):
-        _logger.info('Running interests invoices cron')
+        _logger.info('Running Interest Invoices Cron Job')
         current_date = fields.Date.today()
-        self.search([
-            ('next_date', '<=', current_date)]).create_interest_invoices()
+        self.search([('next_date', '<=', current_date)]
+                    ).create_interest_invoices()
 
     @api.multi
     def create_interest_invoices(self):
-        if not self:
-            return
+        for rec in self:
+            _logger.info(
+                'Creating Interest Invoices (id: %s, company: %s)', rec.id,
+                rec.company_id.name)
+            interests_date = rec.next_date
 
-        self.ensure_one()
-        _logger.info('Creating Interests id %s', self.id)
-        interests_date = self.next_date
+            rule_type = rec.rule_type
+            interval = rec.interval
+            tolerance_interval = rec.tolerance_interval
+            # next_date = fields.Date.from_string(interests_date)
+            if rule_type == 'daily':
+                next_delta = relativedelta(days=+interval)
+                tolerance_delta = relativedelta(days=+tolerance_interval)
+            elif rule_type == 'weekly':
+                next_delta = relativedelta(weeks=+interval)
+                tolerance_delta = relativedelta(weeks=+tolerance_interval)
+            elif rule_type == 'monthly':
+                next_delta = relativedelta(months=+interval)
+                tolerance_delta = relativedelta(months=+tolerance_interval)
+            else:
+                next_delta = relativedelta(years=+interval)
+                tolerance_delta = relativedelta(years=+tolerance_interval)
+            interests_date_date = fields.Date.from_string(interests_date)
+            # buscamos solo facturas que vencieron
+            # antes de hoy menos un periodo
+            # TODO ver si queremos que tambien se calcule interes proporcional
+            # para lo que vencio en este ultimo periodo
+            to_date = fields.Date.to_string(
+                interests_date_date - tolerance_delta)
 
-        rule_type = self.rule_type
-        interval = self.interval
-        tolerance_interval = self.tolerance_interval
-        # next_date = fields.Date.from_string(interests_date)
-        if rule_type == 'daily':
-            next_delta = relativedelta(days=+interval)
-            tolerance_delta = relativedelta(days=+tolerance_interval)
-        elif rule_type == 'weekly':
-            next_delta = relativedelta(weeks=+interval)
-            tolerance_delta = relativedelta(weeks=+tolerance_interval)
-        elif rule_type == 'monthly':
-            next_delta = relativedelta(months=+interval)
-            tolerance_delta = relativedelta(months=+tolerance_interval)
-        else:
-            next_delta = relativedelta(years=+interval)
-            tolerance_delta = relativedelta(years=+tolerance_interval)
-        interests_date_date = fields.Date.from_string(interests_date)
-        # buscamos solo facturas que vencieron antes de hoy menos un periodo
-        # TODO ver si queremos que tambien se calcule interes proporcional para
-        # lo que vencio en este ultimo periodo
-        to_date = fields.Date.to_string(interests_date_date - tolerance_delta)
+            rec.create_invoices(to_date)
 
-        self.create_invoices(to_date)
-
-        # seteamos proxima corrida en hoy mas un periodo
-        self.next_date = fields.Date.to_string(
-            interests_date_date + next_delta)
+            # seteamos proxima corrida en hoy mas un periodo
+            rec.next_date = fields.Date.to_string(
+                interests_date_date + next_delta)
 
     @api.multi
     def create_invoices(self, to_date):
@@ -145,6 +154,11 @@ class ResCompanyInterest(models.Model):
             ('full_reconcile_id', '=', False),
             ('date_maturity', '<', to_date)
         ]
+
+        # Check if a filter is set
+        if self.domain:
+            move_line_domain += safe_eval(self.domain)
+
         move_line = self.env['account.move.line']
         grouped_lines = move_line.read_group(
             domain=move_line_domain,
@@ -153,13 +167,19 @@ class ResCompanyInterest(models.Model):
         )
         self = self.with_context(mail_notrack=True, prefetch_fields=False)
 
-        for line in grouped_lines:
+        total_items = len(grouped_lines)
+        _logger.info('%s interest invoices will be generated', total_items)
+
+        for idx, line in enumerate(grouped_lines):
+
             debt = line['amount_residual']
 
             if not debt or debt <= 0.0:
                 continue
 
-            _logger.info('Creating Interest Invoices for values:\n%s', line)
+            _logger.info(
+                'Creating Interest Invoice (%s of %s) with values:\n%s',
+                idx + 1, total_items, line)
             partner_id = line['partner_id'][0]
 
             partner = self.env['res.partner'].browse(partner_id)
@@ -178,7 +198,12 @@ class ResCompanyInterest(models.Model):
             # update amounts for new invoice
             invoice.compute_taxes()
             if self.automatic_validation:
-                invoice.action_invoice_open()
+                try:
+                    invoice.action_invoice_open()
+                except Exception as e:
+                    _logger.error(
+                        "Something went wrong "
+                        "creating interests invoice: {}".format(e))
 
     @api.multi
     def prepare_info(self, to_date_format, debt):
@@ -246,3 +271,7 @@ class ResCompanyInterest(models.Model):
         line_values = line_data._convert_to_write(
             {field: line_data[field] for field in line_data._cache})
         return line_values
+
+    @api.depends('domain')
+    def _compute_has_domain(self):
+        self.has_domain = len(safe_eval(self.domain)) > 0
